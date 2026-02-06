@@ -31,7 +31,7 @@ def generate_launch_description():
         description='Yaml config file path'
     )
     decalre_config_file_cmd = DeclareLaunchArgument(
-        'config_file', default_value='mid360.yaml',
+        'config_file', default_value='robosense.yaml',
         description='Config file'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
@@ -48,7 +48,8 @@ def generate_launch_description():
         executable='fastlio_mapping',
         parameters=[PathJoinSubstitution([config_path, config_file]),
                     {'use_sim_time': use_sim_time}],
-        output='screen'
+        output='screen',
+        namespace='fast_lio'
     )
     rviz_node = Node(
         package='rviz2',
@@ -68,3 +69,4 @@ def generate_launch_description():
     ld.add_action(rviz_node)
 
     return ld
+
