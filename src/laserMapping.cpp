@@ -53,6 +53,8 @@
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/filters/crop_box.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -141,6 +143,23 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+/*** Localization Mode Variables ***/
+bool localization_mode = false;
+std::string prior_map_path;
+double map_downsample_resolution = 0.5;
+std::vector<double> utm_offset(3, 0.0);
+std::string gnss_topic;
+bool initial_yaw_from_gnss = true;
+
+PointCloudXYZI::Ptr prior_map_cloud(new PointCloudXYZI());
+bool prior_map_loaded = false;
+
+bool gnss_fix_received = false;
+V3D gnss_position(Zero3d);
+Eigen::Quaterniond gnss_orientation(Eigen::Quaterniond::Identity());
+std::mutex gnss_mutex;
+bool loc_initialized = false;
 
 void SigHandle(int sig)
 {
@@ -279,7 +298,98 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
+void lasermap_fov_segment_localization()
+{
+    cub_needrm.clear();
+    kdtree_delete_counter = 0;
+    kdtree_delete_time = 0.0;
+    pointBodyToWorld(XAxisPoint_body, XAxisPoint_world);
+    V3D pos_LiD = pos_lid;
+
+    if (!Localmap_Initialized)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
+            LocalMap_Points.vertex_max[i] = pos_LiD(i) + cube_len / 2.0;
+        }
+        Localmap_Initialized = true;
+        return;
+    }
+
+    float dist_to_map_edge[3][2];
+    bool need_move = false;
+    for (int i = 0; i < 3; i++)
+    {
+        dist_to_map_edge[i][0] = fabs(pos_LiD(i) - LocalMap_Points.vertex_min[i]);
+        dist_to_map_edge[i][1] = fabs(pos_LiD(i) - LocalMap_Points.vertex_max[i]);
+        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE ||
+            dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
+            need_move = true;
+    }
+    if (!need_move) return;
+
+    BoxPointType New_LocalMap_Points, tmp_boxpoints;
+    New_LocalMap_Points = LocalMap_Points;
+    float mov_dist = max((cube_len - 2.0 * MOV_THRESHOLD * DET_RANGE) * 0.5 * 0.9,
+                         double(DET_RANGE * (MOV_THRESHOLD - 1)));
+
+    // Track new slab regions to populate from prior map
+    std::vector<BoxPointType> slabs_to_add;
+
+    for (int i = 0; i < 3; i++)
+    {
+        tmp_boxpoints = LocalMap_Points;
+        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE)
+        {
+            // Robot near min edge: shift cube in -i direction
+            New_LocalMap_Points.vertex_max[i] -= mov_dist;
+            New_LocalMap_Points.vertex_min[i] -= mov_dist;
+            // Old slab to remove (far positive edge)
+            tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
+            cub_needrm.push_back(tmp_boxpoints);
+            // New slab to add (newly revealed negative edge)
+            BoxPointType new_slab = New_LocalMap_Points;
+            new_slab.vertex_max[i] = LocalMap_Points.vertex_min[i];
+            slabs_to_add.push_back(new_slab);
+        }
+        else if (dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
+        {
+            // Robot near max edge: shift cube in +i direction
+            New_LocalMap_Points.vertex_max[i] += mov_dist;
+            New_LocalMap_Points.vertex_min[i] += mov_dist;
+            // Old slab to remove (far negative edge)
+            tmp_boxpoints.vertex_max[i] = LocalMap_Points.vertex_min[i] + mov_dist;
+            cub_needrm.push_back(tmp_boxpoints);
+            // New slab to add (newly revealed positive edge)
+            BoxPointType new_slab = New_LocalMap_Points;
+            new_slab.vertex_min[i] = LocalMap_Points.vertex_max[i];
+            slabs_to_add.push_back(new_slab);
+        }
+    }
+    LocalMap_Points = New_LocalMap_Points;
+
+    // Delete old regions from ikd-tree
+    points_cache_collect();
+    double delete_begin = omp_get_wtime();
+    if (cub_needrm.size() > 0)
+        kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
+    kdtree_delete_time = omp_get_wtime() - delete_begin;
+
+    // Add new regions from prior map
+    for (const auto &slab : slabs_to_add)
+    {
+        PointVector new_points = crop_prior_map_to_box(slab);
+        if (!new_points.empty())
+        {
+            ikdtree.Add_Points(new_points, true);
+            std::cout << "[Localization] Added " << new_points.size()
+                      << " prior map points to ikd-tree" << std::endl;
+        }
+    }
+}
+
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
     mtx_buffer.lock();
     scan_count ++;
@@ -337,6 +447,90 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+}
+
+void gnss_cbk(const nav_msgs::msg::Odometry::UniquePtr msg)
+{
+    if (!localization_mode || gnss_fix_received) return;
+
+    std::lock_guard<std::mutex> lock(gnss_mutex);
+
+    double utm_x = msg->pose.pose.position.x;
+    double utm_y = msg->pose.pose.position.y;
+    double utm_z = msg->pose.pose.position.z;
+
+    // Reject zero/invalid positions
+    if (std::abs(utm_x) < 1.0 && std::abs(utm_y) < 1.0) return;
+
+    // Convert UTM to local frame
+    gnss_position(0) = utm_x - utm_offset[0];
+    gnss_position(1) = utm_y - utm_offset[1];
+    gnss_position(2) = utm_z - utm_offset[2];
+
+    gnss_orientation.x() = msg->pose.pose.orientation.x;
+    gnss_orientation.y() = msg->pose.pose.orientation.y;
+    gnss_orientation.z() = msg->pose.pose.orientation.z;
+    gnss_orientation.w() = msg->pose.pose.orientation.w;
+
+    gnss_fix_received = true;
+    std::cout << "[Localization] GNSS fix received. Local position: ["
+              << gnss_position(0) << ", " << gnss_position(1) << ", "
+              << gnss_position(2) << "]" << std::endl;
+}
+
+bool load_prior_map()
+{
+    std::cout << "[Localization] Loading prior map from: " << prior_map_path << std::endl;
+
+    PointCloudXYZI::Ptr raw_cloud(new PointCloudXYZI());
+
+    if (pcl::io::loadPLYFile<PointType>(prior_map_path, *raw_cloud) == -1)
+    {
+        std::cerr << "[Localization] ERROR: Failed to load PLY file: " << prior_map_path << std::endl;
+        return false;
+    }
+    std::cout << "[Localization] Loaded " << raw_cloud->size() << " points from PLY" << std::endl;
+
+    // Subtract UTM offset (double arithmetic to avoid float precision loss)
+    for (auto &pt : raw_cloud->points)
+    {
+        pt.x = static_cast<float>(static_cast<double>(pt.x) - utm_offset[0]);
+        pt.y = static_cast<float>(static_cast<double>(pt.y) - utm_offset[1]);
+        pt.z = static_cast<float>(static_cast<double>(pt.z) - utm_offset[2]);
+    }
+
+    // Downsample
+    pcl::VoxelGrid<PointType> voxel_filter;
+    voxel_filter.setLeafSize(map_downsample_resolution, map_downsample_resolution, map_downsample_resolution);
+    voxel_filter.setInputCloud(raw_cloud);
+    voxel_filter.filter(*prior_map_cloud);
+
+    std::cout << "[Localization] After downsampling (" << map_downsample_resolution
+              << "m): " << prior_map_cloud->size() << " points" << std::endl;
+
+    prior_map_loaded = true;
+    return true;
+}
+
+PointVector crop_prior_map_to_box(const BoxPointType &box)
+{
+    PointVector result;
+
+    pcl::CropBox<PointType> crop_filter;
+    crop_filter.setMin(Eigen::Vector4f(box.vertex_min[0], box.vertex_min[1], box.vertex_min[2], 1.0f));
+    crop_filter.setMax(Eigen::Vector4f(box.vertex_max[0], box.vertex_max[1], box.vertex_max[2], 1.0f));
+    crop_filter.setInputCloud(prior_map_cloud);
+
+    PointCloudXYZI::Ptr cropped(new PointCloudXYZI());
+    crop_filter.filter(*cropped);
+
+    result.reserve(cropped->size());
+    for (const auto &pt : cropped->points)
+    {
+        result.push_back(pt);
+    }
+
+    return result;
 }
 
 double lidar_mean_scantime = 0.0;
@@ -795,6 +989,14 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
+        // Localization mode parameters
+        this->declare_parameter<bool>("localization.enabled", false);
+        this->declare_parameter<std::string>("localization.prior_map_path", "");
+        this->declare_parameter<double>("localization.map_downsample_resolution", 0.5);
+        this->declare_parameter<std::vector<double>>("localization.utm_offset", std::vector<double>(3, 0.0));
+        this->declare_parameter<std::string>("localization.gnss_topic", "/fixposition/utm/odometry");
+        this->declare_parameter<bool>("localization.initial_yaw_from_gnss", true);
+
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -830,6 +1032,14 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+
+        // Read localization parameters
+        this->get_parameter_or<bool>("localization.enabled", localization_mode, false);
+        this->get_parameter_or<std::string>("localization.prior_map_path", prior_map_path, std::string(""));
+        this->get_parameter_or<double>("localization.map_downsample_resolution", map_downsample_resolution, 0.5);
+        this->get_parameter_or<std::vector<double>>("localization.utm_offset", utm_offset, std::vector<double>(3, 0.0));
+        this->get_parameter_or<std::string>("localization.gnss_topic", gnss_topic, std::string("/fixposition/utm/odometry"));
+        this->get_parameter_or<bool>("localization.initial_yaw_from_gnss", initial_yaw_from_gnss, true);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -878,10 +1088,32 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
+        /*** Localization mode startup ***/
+        if (localization_mode)
+        {
+            RCLCPP_INFO(this->get_logger(), "=== LOCALIZATION MODE ENABLED ===");
+            RCLCPP_INFO(this->get_logger(), "Prior map: %s", prior_map_path.c_str());
+            RCLCPP_INFO(this->get_logger(), "UTM offset: [%.2f, %.2f, %.2f]",
+                        utm_offset[0], utm_offset[1], utm_offset[2]);
+            if (!load_prior_map())
+            {
+                RCLCPP_ERROR(this->get_logger(), "Failed to load prior map. Shutting down.");
+                rclcpp::shutdown();
+                return;
+            }
+        }
+
         /*** ROS subscribe initialization ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), imu_cbk);
-	pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
+        if (localization_mode)
+        {
+            sub_gnss_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                gnss_topic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), gnss_cbk);
+            pubOdomUTM_ = this->create_publisher<nav_msgs::msg::Odometry>("odometry_utm", 20);
+            RCLCPP_INFO(this->get_logger(), "Subscribed to GNSS: %s", gnss_topic.c_str());
+        }
+        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
@@ -943,7 +1175,10 @@ private:
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            if (localization_mode)
+                lasermap_fov_segment_localization();
+            else
+                lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -953,18 +1188,90 @@ private:
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
-                RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
-                if(feats_down_size > 5)
+                if (localization_mode)
                 {
-                    ikdtree.set_downsample_param(filter_size_map_min);
-                    feats_down_world->resize(feats_down_size);
-                    for(int i = 0; i < feats_down_size; i++)
+                    // Localization mode: wait for GNSS fix, then build from prior map
+                    if (!gnss_fix_received)
                     {
-                        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "Waiting for GNSS fix on topic: %s", gnss_topic.c_str());
+                        return;
                     }
-                    ikdtree.Build(feats_down_world->points);
+                    if (!loc_initialized)
+                    {
+                        RCLCPP_INFO(this->get_logger(), "Initializing localization with GNSS pose...");
+
+                        // Inject GPS position into EKF state
+                        state_ikfom init_state = kf.get_x();
+                        init_state.pos = gnss_position;
+
+                        if (initial_yaw_from_gnss)
+                        {
+                            // Extract yaw from GNSS orientation, keep pitch/roll from IMU gravity
+                            M3D gnss_rot = gnss_orientation.toRotationMatrix();
+                            // Use full GNSS orientation (yaw from heading, pitch/roll from INS)
+                            init_state.rot = SO3(gnss_rot);
+                        }
+
+                        kf.change_x(init_state);
+
+                        // Set initial covariance (tight for RTK position)
+                        auto init_P = kf.get_P();
+                        init_P(0,0) = init_P(1,1) = init_P(2,2) = 0.01;  // position ~10cm
+                        init_P(3,3) = init_P(4,4) = init_P(5,5) = 0.01;  // rotation
+                        kf.change_P(init_P);
+
+                        // Update pos_lid for cube initialization
+                        state_point = kf.get_x();
+                        pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+                        // Build ikd-tree from prior map within initial cube
+                        ikdtree.set_downsample_param(filter_size_map_min);
+
+                        BoxPointType initial_box;
+                        for (int i = 0; i < 3; i++)
+                        {
+                            initial_box.vertex_min[i] = pos_lid(i) - cube_len / 2.0;
+                            initial_box.vertex_max[i] = pos_lid(i) + cube_len / 2.0;
+                        }
+
+                        PointVector init_points = crop_prior_map_to_box(initial_box);
+
+                        if (init_points.size() < 10)
+                        {
+                            RCLCPP_ERROR(this->get_logger(),
+                                "Only %zu prior map points in initial cube! Check UTM offset and map.",
+                                init_points.size());
+                            return;
+                        }
+
+                        RCLCPP_INFO(this->get_logger(),
+                            "Building ikd-tree with %zu prior map points", init_points.size());
+                        ikdtree.Build(init_points);
+
+                        loc_initialized = true;
+                        RCLCPP_INFO(this->get_logger(),
+                            "Localization initialized at [%.2f, %.2f, %.2f]",
+                            gnss_position(0), gnss_position(1), gnss_position(2));
+                        return;
+                    }
                 }
-                return;
+                else
+                {
+                    // Original SLAM initialization
+                    RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
+                    if(feats_down_size > 5)
+                    {
+                        ikdtree.set_downsample_param(filter_size_map_min);
+                        feats_down_world->resize(feats_down_size);
+                        for(int i = 0; i < feats_down_size; i++)
+                        {
+                            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                        }
+                        ikdtree.Build(feats_down_world->points);
+                    }
+                    return;
+                }
             }
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
@@ -1017,9 +1324,25 @@ private:
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
+            /******* Publish UTM odometry (localization mode) *******/
+            if (localization_mode && pubOdomUTM_)
+            {
+                nav_msgs::msg::Odometry odom_utm;
+                odom_utm.header.frame_id = "utm";
+                odom_utm.child_frame_id = "base_link";
+                odom_utm.header.stamp = get_ros_time(lidar_end_time);
+                odom_utm.pose.pose.position.x = state_point.pos(0) + utm_offset[0];
+                odom_utm.pose.pose.position.y = state_point.pos(1) + utm_offset[1];
+                odom_utm.pose.pose.position.z = state_point.pos(2) + utm_offset[2];
+                odom_utm.pose.pose.orientation = odomAftMapped.pose.pose.orientation;
+                odom_utm.pose.covariance = odomAftMapped.pose.covariance;
+                pubOdomUTM_->publish(odom_utm);
+            }
+
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
+            if (!localization_mode)
+                map_incremental();
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1091,6 +1414,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_gnss_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomUTM_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
