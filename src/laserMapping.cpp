@@ -601,8 +601,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.twist.linear.y = v_body(1);
     odomAftMapped.twist.twist.linear.z = v_body(2);
 
-    pubOdomAftMapped->publish(odomAftMapped);
+    // Covariance from FastLIO's internal IEKF state.
+    // State order: pos(0-2), rot(3-5), offset_R(6-8), offset_T(9-11),
+    //              vel(12-14), bg(15-17), ba(18-20), grav(21-22)
     auto P = kf.get_P();
+
+    // Pose covariance (6x6): position(0-2) and rotation(3-5) in P
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -614,9 +618,34 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    // TF broadcast disabled: camera_init → body is disconnected from the
-    // robot's TF tree (EKF publishes odom → control_frame). The odometry
-    // message above is sufficient for EKF consumption.
+    // Twist covariance: rotate velocity covariance from world to body frame.
+    // P(12:14, 12:14) = velocity covariance in camera_init frame.
+    // C_body = R^T * C_world * R
+    Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
+    Eigen::Matrix3d C_vel_world = P.block<3, 3>(12, 12);
+    Eigen::Matrix3d C_vel_body = R.transpose() * C_vel_world * R;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            odomAftMapped.twist.covariance[i * 6 + j] = C_vel_body(i, j);
+
+    pubOdomAftMapped->publish(odomAftMapped);
+
+    // Publish camera_init -> body TF for visualization (e.g. Foxglove).
+    // This tree is intentionally detached from the robot's main TF tree
+    // (ascento/odom -> ascento/control_frame). It lets you see FastLIO's
+    // internal estimate and point clouds in their native frames.
+    geometry_msgs::msg::TransformStamped trans;
+    trans.header.frame_id = "camera_init";
+    trans.child_frame_id = "body";
+    trans.header.stamp = get_ros_time(lidar_end_time);
+    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+    tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
