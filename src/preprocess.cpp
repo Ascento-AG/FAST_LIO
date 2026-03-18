@@ -368,15 +368,27 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZI> pl_orig;
+  pcl::PointCloud<robosense_ros::Point> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.points.size();
   if (plsize == 0)
     return;
   pl_surf.reserve(plsize);
 
-  for(uint i = 0; i < plsize; ++i)
+  // Scan start time from first point (absolute seconds)
+  double scan_start_time = pl_orig.points[0].timestamp;
+
+  for (uint i = 0; i < plsize; ++i)
   {
+    if (i % point_filter_num != 0)
+      continue;
+
+    double range_sq = pl_orig.points[i].x * pl_orig.points[i].x +
+                      pl_orig.points[i].y * pl_orig.points[i].y +
+                      pl_orig.points[i].z * pl_orig.points[i].z;
+    if (range_sq < (blind * blind))
+      continue;
+
     PointType added_pt;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
@@ -385,12 +397,11 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = 0.;
+    // Relative time from scan start in ms (FastLIO convention)
+    added_pt.curvature =
+        (pl_orig.points[i].timestamp - scan_start_time) * 1000.0;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
-    {
-      pl_surf.push_back(std::move(added_pt));
-    }
+    pl_surf.push_back(std::move(added_pt));
   }
 }
 
