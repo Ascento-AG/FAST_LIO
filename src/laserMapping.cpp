@@ -645,9 +645,10 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     // Body-frame angular velocity: bias-corrected from IEKF.
     // p_imu->angvel_last is set in UndistortPcl as (raw_gyro - gyro_bias).
-    odomAftMapped.twist.twist.angular.x = p_imu->angvel_last(0);
-    odomAftMapped.twist.twist.angular.y = p_imu->angvel_last(1);
-    odomAftMapped.twist.twist.angular.z = p_imu->angvel_last(2);
+    const V3D &angvel = p_imu->get_angvel_last();
+    odomAftMapped.twist.twist.angular.x = angvel(0);
+    odomAftMapped.twist.twist.angular.y = angvel(1);
+    odomAftMapped.twist.twist.angular.z = angvel(2);
 
     // Angular velocity covariance from gyro bias uncertainty.
     // P(15:17, 15:17) = gyro bias covariance. The angular velocity
