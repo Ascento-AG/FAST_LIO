@@ -643,6 +643,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         for (int j = 0; j < 3; j++)
             odomAftMapped.twist.covariance[i * 6 + j] = C_vel_body(i, j);
 
+    // Body-frame angular velocity: bias-corrected from IEKF.
+    // p_imu->angvel_last is set in UndistortPcl as (raw_gyro - gyro_bias).
+    odomAftMapped.twist.twist.angular.x = p_imu->angvel_last(0);
+    odomAftMapped.twist.twist.angular.y = p_imu->angvel_last(1);
+    odomAftMapped.twist.twist.angular.z = p_imu->angvel_last(2);
+
+    // Angular velocity covariance from gyro bias uncertainty.
+    // P(15:17, 15:17) = gyro bias covariance. The angular velocity
+    // uncertainty is at least as large as the bias uncertainty.
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            odomAftMapped.twist.covariance[(i + 3) * 6 + (j + 3)] = P(15 + i, 15 + j);
+
     pubOdomAftMapped->publish(odomAftMapped);
 
     // Publish camera_init -> body TF for visualization (e.g. Foxglove).
