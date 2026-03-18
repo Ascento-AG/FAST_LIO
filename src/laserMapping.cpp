@@ -370,6 +370,21 @@ bool sync_packages(MeasureGroup &meas)
 
         meas.lidar_end_time = lidar_end_time;
 
+        // Diagnostic logging for scan timing
+        static int sync_log_count = 0;
+        sync_log_count++;
+        if (sync_log_count <= 5 || sync_log_count % 100 == 0) {
+            double last_curv = meas.lidar->points.size() > 0
+                ? meas.lidar->points.back().curvature : -1;
+            std::cerr << "[SYNC] scan#" << sync_log_count
+                      << " pts=" << meas.lidar->points.size()
+                      << " last_curvature_ms=" << last_curv
+                      << " scan_time_s=" << std::fixed << std::setprecision(6)
+                      << (lidar_end_time - meas.lidar_beg_time)
+                      << " mean_scantime=" << lidar_mean_scantime
+                      << std::endl;
+        }
+
         lidar_pushed = true;
     }
 

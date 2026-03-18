@@ -223,8 +223,22 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** sort point clouds by offset time ***/
   pcl_out = *(meas.lidar);
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
-  // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
-  //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
+
+  // Diagnostic logging for undistortion inputs
+  static int undist_log_count = 0;
+  undist_log_count++;
+  if (undist_log_count <= 5 || undist_log_count % 100 == 0) {
+    double min_c = pcl_out.points.empty() ? 0 : pcl_out.points.front().curvature;
+    double max_c = pcl_out.points.empty() ? 0 : pcl_out.points.back().curvature;
+    std::cerr << "[UNDISTORT] scan#" << undist_log_count
+              << " pts=" << pcl_out.points.size()
+              << " curvature=[" << min_c << ", " << max_c << "] ms"
+              << " imu=[" << std::fixed << std::setprecision(6)
+              << imu_beg_time << ", " << imu_end_time << "]"
+              << " pcl=[" << pcl_beg_time << ", " << pcl_end_time << "]"
+              << " imu_msgs=" << static_cast<int>(v_imu.size())
+              << std::endl;
+  }
 
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();

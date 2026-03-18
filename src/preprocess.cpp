@@ -2,6 +2,8 @@
 
 #include <pcl/common/common.h>
 
+#include <iomanip>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
@@ -73,6 +75,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
 
     case VELO16:
       velodyne_handler(msg);
+      break;
+
+    case ROBOSENSE:
+      robosense_handler(msg);
       break;
 
     default:
@@ -362,32 +368,123 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   }
 }
 
-void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
-{
+void Preprocess::robosense_handler(
+    const sensor_msgs::msg::PointCloud2::UniquePtr& msg) {
   pl_surf.clear();
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<robosense_ros::Point> pl_orig;
+  pcl::PointCloud<pcl::PointXYZI> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.points.size();
-  if (plsize == 0)
-    return;
+  if (plsize == 0) return;
   pl_surf.reserve(plsize);
 
-  // Scan start time from first point (absolute seconds)
-  double scan_start_time = pl_orig.points[0].timestamp;
+  // Find timestamp field: "timestamp" (rslidar_sdk) or "time" (alt driver)
+  int ts_offset = -1;
+  uint8_t ts_datatype = 0;
+  std::string ts_field_name;
+  for (const auto& field : msg->fields) {
+    if (field.name == "timestamp" || field.name == "time") {
+      ts_offset = field.offset;
+      ts_datatype = field.datatype;
+      ts_field_name = field.name;
+      break;
+    }
+  }
 
-  for (uint i = 0; i < plsize; ++i)
-  {
-    if (i % point_filter_num != 0)
-      continue;
+  // --- First-scan logging: field layout ---
+  static bool first_scan = true;
+  if (first_scan) {
+    first_scan = false;
+    std::cerr << "[ROBOSENSE] First scan: " << plsize << " points"
+              << ", point_step=" << msg->point_step
+              << ", height=" << msg->height
+              << ", width=" << msg->width << std::endl;
+    std::cerr << "[ROBOSENSE] Fields:";
+    for (const auto& f : msg->fields) {
+      std::cerr << " " << f.name << "(off=" << f.offset
+                << ",type=" << static_cast<int>(f.datatype) << ")";
+    }
+    std::cerr << std::endl;
+    if (ts_offset >= 0) {
+      std::cerr << "[ROBOSENSE] Using timestamp field: '" << ts_field_name
+                << "' at offset " << ts_offset
+                << " (datatype=" << static_cast<int>(ts_datatype) << ")"
+                << std::endl;
+    } else {
+      std::cerr << "[ROBOSENSE] WARNING: No timestamp field found! "
+                << "Motion compensation will be disabled (curvature=0)."
+                << std::endl;
+    }
+  }
+
+  // Helper: read timestamp from raw PointCloud2 bytes
+  auto read_timestamp = [&](uint idx) -> double {
+    if (ts_offset < 0) return 0.0;
+    const uint8_t* ptr = &msg->data[idx * msg->point_step + ts_offset];
+    if (ts_datatype == sensor_msgs::msg::PointField::FLOAT64) {
+      double val;
+      memcpy(&val, ptr, sizeof(double));
+      return val;
+    } else if (ts_datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      float val;
+      memcpy(&val, ptr, sizeof(float));
+      return static_cast<double>(val);
+    }
+    return 0.0;
+  };
+
+  double scan_start_time = read_timestamp(0);
+  double scan_end_time = (plsize > 1) ? read_timestamp(plsize - 1) : scan_start_time;
+  double scan_duration_ms = (scan_end_time - scan_start_time) * 1000.0;
+
+  // --- First-scan logging: sample points ---
+  static bool first_samples = true;
+  if (first_samples) {
+    first_samples = false;
+    int n = std::min(3, plsize);
+    for (int i = 0; i < n; ++i) {
+      std::cerr << "[ROBOSENSE]   pt[" << i << "] xyz=("
+                << pl_orig.points[i].x << "," << pl_orig.points[i].y
+                << "," << pl_orig.points[i].z << ") intensity="
+                << pl_orig.points[i].intensity << " ts=" << std::fixed
+                << std::setprecision(9) << read_timestamp(i) << std::endl;
+    }
+    if (plsize > 3) {
+      std::cerr << "[ROBOSENSE]   pt[" << plsize - 1 << "] ts=" << std::fixed
+                << std::setprecision(9) << scan_end_time << std::endl;
+    }
+    std::cerr << "[ROBOSENSE]   scan_duration=" << std::setprecision(3)
+              << scan_duration_ms << " ms" << std::endl;
+  }
+
+  // --- Periodic logging ---
+  static int scan_count = 0;
+  scan_count++;
+  bool do_log = (scan_count <= 5 || scan_count % 100 == 0);
+  if (do_log) {
+    std::cerr << "[ROBOSENSE] scan#" << scan_count << " pts=" << plsize
+              << " duration_ms=" << std::fixed << std::setprecision(3)
+              << scan_duration_ms << std::endl;
+  }
+
+  // --- Sanity warnings ---
+  if (ts_offset >= 0 && (scan_duration_ms < 0.0 || scan_duration_ms > 200.0)) {
+    std::cerr << "[ROBOSENSE] WARNING: abnormal scan duration: "
+              << scan_duration_ms << " ms (expected ~100ms for 10Hz)"
+              << std::endl;
+  }
+
+  // --- Build output cloud ---
+  int kept = 0;
+  for (uint i = 0; i < plsize; ++i) {
+    if (i % point_filter_num != 0) continue;
 
     double range_sq = pl_orig.points[i].x * pl_orig.points[i].x +
                       pl_orig.points[i].y * pl_orig.points[i].y +
                       pl_orig.points[i].z * pl_orig.points[i].z;
-    if (range_sq < (blind * blind))
-      continue;
+    if (range_sq < (blind * blind)) continue;
 
     PointType added_pt;
     added_pt.normal_x = 0;
@@ -397,11 +494,60 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    // Relative time from scan start in ms (FastLIO convention)
     added_pt.curvature =
-        (pl_orig.points[i].timestamp - scan_start_time) * 1000.0;
+        (read_timestamp(i) - scan_start_time) * 1000.0;  // relative ms
 
     pl_surf.push_back(std::move(added_pt));
+    ++kept;
+  }
+
+  // --- Log output stats ---
+  if (do_log) {
+    double min_curv = kept > 0 ? pl_surf.front().curvature : 0;
+    double max_curv = kept > 0 ? pl_surf.back().curvature : 0;
+    std::cerr << "[ROBOSENSE]   output=" << kept << "/" << plsize
+              << " (point_filter_num=" << point_filter_num
+              << ", blind=" << blind << ")"
+              << " curvature=[" << std::setprecision(3) << min_curv << ", "
+              << max_curv << "] ms" << std::endl;
+  }
+
+  // --- Warn on negative curvature ---
+  if (kept > 0 && pl_surf.front().curvature < -0.001) {
+    std::cerr << "[ROBOSENSE] WARNING: negative curvature detected: "
+              << pl_surf.front().curvature << " ms" << std::endl;
+  }
+}
+
+void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<pcl::PointXYZI> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
+  pl_surf.reserve(plsize);
+
+  for(uint i = 0; i < plsize; ++i)
+  {
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pl_orig.points[i].x;
+    added_pt.y = pl_orig.points[i].y;
+    added_pt.z = pl_orig.points[i].z;
+    added_pt.intensity = pl_orig.points[i].intensity;
+    added_pt.curvature = 0.;
+
+    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    {
+      pl_surf.push_back(std::move(added_pt));
+    }
   }
 }
 
