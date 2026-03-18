@@ -435,26 +435,51 @@ void Preprocess::robosense_handler(
     return 0.0;
   };
 
-  double scan_start_time = read_timestamp(0);
-  double scan_end_time = (plsize > 1) ? read_timestamp(plsize - 1) : scan_start_time;
+  // Find scan_start_time from first valid (non-NaN) point.
+  // The E1R pads unused slots with NaN coordinates; their timestamps
+  // may still be valid but we want the first real point for consistency.
+  double scan_start_time = 0.0;
+  int first_valid_idx = -1;
+  for (int i = 0; i < plsize; ++i) {
+    if (std::isfinite(pl_orig.points[i].x)) {
+      scan_start_time = read_timestamp(i);
+      first_valid_idx = i;
+      break;
+    }
+  }
+  // If no valid point found, use pt[0] timestamp (still valid even on NaN pts)
+  if (first_valid_idx < 0) {
+    scan_start_time = read_timestamp(0);
+  }
+
+  // Find scan_end_time from last valid point
+  double scan_end_time = scan_start_time;
+  for (int i = plsize - 1; i >= 0; --i) {
+    if (std::isfinite(pl_orig.points[i].x)) {
+      scan_end_time = read_timestamp(i);
+      break;
+    }
+  }
   double scan_duration_ms = (scan_end_time - scan_start_time) * 1000.0;
 
   // --- First-scan logging: sample points ---
   static bool first_samples = true;
   if (first_samples) {
     first_samples = false;
-    int n = std::min(3, plsize);
-    for (int i = 0; i < n; ++i) {
+    std::cerr << "[ROBOSENSE]   first_valid_idx=" << first_valid_idx
+              << std::endl;
+    // Log a few points around the first valid index
+    int sample_start = std::max(0, first_valid_idx);
+    int sample_end = std::min(plsize, sample_start + 3);
+    for (int i = sample_start; i < sample_end; ++i) {
       std::cerr << "[ROBOSENSE]   pt[" << i << "] xyz=("
                 << pl_orig.points[i].x << "," << pl_orig.points[i].y
                 << "," << pl_orig.points[i].z << ") intensity="
                 << pl_orig.points[i].intensity << " ts=" << std::fixed
                 << std::setprecision(9) << read_timestamp(i) << std::endl;
     }
-    if (plsize > 3) {
-      std::cerr << "[ROBOSENSE]   pt[" << plsize - 1 << "] ts=" << std::fixed
-                << std::setprecision(9) << scan_end_time << std::endl;
-    }
+    std::cerr << "[ROBOSENSE]   last valid ts=" << std::fixed
+              << std::setprecision(9) << scan_end_time << std::endl;
     std::cerr << "[ROBOSENSE]   scan_duration=" << std::setprecision(3)
               << scan_duration_ms << " ms" << std::endl;
   }
@@ -477,9 +502,20 @@ void Preprocess::robosense_handler(
   }
 
   // --- Build output cloud ---
+  // The E1R solid-state LiDAR pads unused slots with NaN. IEEE754 NaN
+  // comparisons are always false, so "range_sq > blind*blind" passes NaN
+  // through. We must reject them explicitly with std::isfinite.
   int kept = 0;
+  int nan_count = 0;
   for (uint i = 0; i < plsize; ++i) {
     if (i % point_filter_num != 0) continue;
+
+    if (!std::isfinite(pl_orig.points[i].x) ||
+        !std::isfinite(pl_orig.points[i].y) ||
+        !std::isfinite(pl_orig.points[i].z)) {
+      ++nan_count;
+      continue;
+    }
 
     double range_sq = pl_orig.points[i].x * pl_orig.points[i].x +
                       pl_orig.points[i].y * pl_orig.points[i].y +
@@ -506,7 +542,8 @@ void Preprocess::robosense_handler(
     double min_curv = kept > 0 ? pl_surf.front().curvature : 0;
     double max_curv = kept > 0 ? pl_surf.back().curvature : 0;
     std::cerr << "[ROBOSENSE]   output=" << kept << "/" << plsize
-              << " (point_filter_num=" << point_filter_num
+              << " (nan=" << nan_count
+              << ", point_filter_num=" << point_filter_num
               << ", blind=" << blind << ")"
               << " curvature=[" << std::setprecision(3) << min_curv << ", "
               << max_curv << "] ms" << std::endl;
