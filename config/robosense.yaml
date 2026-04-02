@@ -56,4 +56,4 @@
         initial_pose:
             require: true
             odom_frame: "ascento/odom"
-            imu_frame: "vectornav_vn100_link"
+            imu_frame: "imu_link"
