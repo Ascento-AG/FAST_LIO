@@ -55,10 +55,14 @@
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -97,6 +101,17 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
+
+/*** Initial pose support ***/
+bool require_initial_pose = false;        // If true, block until initial pose received
+std::string initial_pose_odom_frame;      // e.g., "ascento/odom"
+std::string initial_pose_imu_frame;       // e.g., "vectornav_vn100_link"
+std::mutex initial_pose_mutex;
+bool initial_pose_received = false;
+bool initial_pose_applied = false;
+V3D initial_pos = V3D::Zero();
+Eigen::Quaterniond initial_rot = Eigen::Quaterniond::Identity();
+bool reset_requested = false;                 // Flag for local frame reset
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -148,6 +163,26 @@ void SigHandle(int sig)
     std::cout << "catch sig %d" << sig << std::endl;
     sig_buffer.notify_all();
     rclcpp::shutdown();
+}
+
+void initial_pose_cbk(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(initial_pose_mutex);
+    initial_pos << msg->pose.position.x,
+                   msg->pose.position.y,
+                   msg->pose.position.z;
+    initial_rot = Eigen::Quaterniond(msg->pose.orientation.w,
+                                     msg->pose.orientation.x,
+                                     msg->pose.orientation.y,
+                                     msg->pose.orientation.z);
+    initial_pose_received = true;
+    initial_pose_applied = false;
+    cout << "Received initial pose: pos=(" << initial_pos.transpose()
+         << "), yaw=" << atan2(2.0 * (initial_rot.w() * initial_rot.z() +
+                                      initial_rot.x() * initial_rot.y()),
+                               1.0 - 2.0 * (initial_rot.y() * initial_rot.y() +
+                                             initial_rot.z() * initial_rot.z()))
+         * 180.0 / M_PI << " deg" << endl;
 }
 
 inline void dump_lio_state_to_log(FILE *fp)  
@@ -533,7 +568,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = "lio_imu";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -603,8 +638,8 @@ void set_posestamp(T & out)
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "ascento/odom";
-    odomAftMapped.child_frame_id = "ascento/base";
+    odomAftMapped.header.frame_id = "camera_init";
+    odomAftMapped.child_frame_id = "lio_imu";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
 
@@ -659,13 +694,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     pubOdomAftMapped->publish(odomAftMapped);
 
-    // Publish camera_init -> body TF for visualization (e.g. Foxglove).
-    // This tree is intentionally detached from the robot's main TF tree
-    // (ascento/odom -> ascento/control_frame). It lets you see FastLIO's
-    // internal estimate and point clouds in their native frames.
+    // Publish camera_init -> lio_imu TF for visualization (e.g. Foxglove).
+    // Once the mux publishes odom -> camera_init, this connects to the
+    // main TF tree: odom -> camera_init -> lio_imu.
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
+    trans.child_frame_id = "lio_imu";
     trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
@@ -889,7 +923,22 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
+        // Initial pose: if require_initial_pose is true, Fast-LIO will not
+        // process scans until it receives the IMU pose in odom frame (via TF
+        // lookup or topic). This ensures camera_init is aligned with odom.
+        this->declare_parameter<bool>("initial_pose.require", false);
+        this->declare_parameter<string>("initial_pose.odom_frame", "ascento/odom");
+        this->declare_parameter<string>("initial_pose.imu_frame", "vectornav_vn100_link");
+        this->get_parameter_or<bool>("initial_pose.require", require_initial_pose, false);
+        this->get_parameter_or<string>("initial_pose.odom_frame", initial_pose_odom_frame, "ascento/odom");
+        this->get_parameter_or<string>("initial_pose.imu_frame", initial_pose_imu_frame, "vectornav_vn100_link");
+
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        if (require_initial_pose) {
+            RCLCPP_INFO(this->get_logger(),
+                "Requiring initial pose: will look up TF %s -> %s before processing",
+                initial_pose_odom_frame.c_str(), initial_pose_imu_frame.c_str());
+        }
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -939,6 +988,17 @@ public:
         /*** ROS subscribe initialization ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), imu_cbk);
+        sub_initial_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/fast_lio/set_initial_pose", rclcpp::QoS(rclcpp::KeepLast(1)).reliable(), initial_pose_cbk);
+
+        // Subscribe to local frame reset (triggered when control loop restarts
+        // and EKF is reset to origin). Fast-LIO must also reset to stay consistent.
+        sub_local_frame_reset_ = this->create_subscription<std_msgs::msg::Empty>(
+            "/ascento/local_frame_reset", 1,
+            [this](const std_msgs::msg::Empty::SharedPtr) {
+                RCLCPP_WARN(this->get_logger(), "Local frame reset received, will re-initialize");
+                reset_requested = true;
+            });
 	pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud_effected", 20);
@@ -946,6 +1006,8 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -969,6 +1031,22 @@ public:
 private:
     void timer_callback()
     {
+        // Handle local frame reset: EKF was reset to (0,0,0), so Fast-LIO
+        // must also re-initialize to stay consistent. Reset the IEKF state
+        // and clear the map, then re-acquire initial pose from TF.
+        if (reset_requested) {
+            reset_requested = false;
+            flg_first_scan = true;
+            flg_EKF_inited = false;
+            initial_pose_applied = false;
+            initial_pose_received = false;
+            ikdtree.Root_Node = nullptr;
+            ikdtree.set_downsample_param(filter_size_map_min);
+            kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+            p_imu->Reset();
+            RCLCPP_INFO(this->get_logger(), "Fast-LIO reset complete, waiting for initial pose");
+        }
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1000,6 +1078,63 @@ private:
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
+
+            // Apply initial pose once after EKF initialization completes.
+            // The initial pose is the IMU position/orientation in the odom frame.
+            // This sets camera_init aligned with odom so that LIO positions are
+            // directly usable in the odom frame (via the mux's gravity-corrected TF).
+            //
+            // Sources (first to succeed wins):
+            //   1. Topic: /fast_lio/set_initial_pose (PoseStamped)
+            //   2. TF lookup: odom_frame -> imu_frame
+            //
+            // If require_initial_pose is true, processing blocks until one succeeds.
+            if (flg_EKF_inited && !initial_pose_applied) {
+                std::lock_guard<std::mutex> lock(initial_pose_mutex);
+
+                // Try topic first (may have been set by external node)
+                if (!initial_pose_received && require_initial_pose) {
+                    // Try TF lookup: odom -> imu_frame
+                    try {
+                        auto tf = tf_buffer_->lookupTransform(
+                            initial_pose_odom_frame, initial_pose_imu_frame,
+                            tf2::TimePointZero, tf2::durationFromSec(0.0));
+                        initial_pos << tf.transform.translation.x,
+                                       tf.transform.translation.y,
+                                       tf.transform.translation.z;
+                        initial_rot = Eigen::Quaterniond(
+                            tf.transform.rotation.w, tf.transform.rotation.x,
+                            tf.transform.rotation.y, tf.transform.rotation.z);
+                        initial_pose_received = true;
+                        RCLCPP_INFO(this->get_logger(),
+                            "Initial pose from TF (%s -> %s): pos=(%.2f, %.2f, %.2f)",
+                            initial_pose_odom_frame.c_str(),
+                            initial_pose_imu_frame.c_str(),
+                            initial_pos(0), initial_pos(1), initial_pos(2));
+                    } catch (const tf2::TransformException&) {
+                        RCLCPP_INFO_THROTTLE(this->get_logger(),
+                            *this->get_clock(), 2000,
+                            "Waiting for initial pose TF (%s -> %s)...",
+                            initial_pose_odom_frame.c_str(),
+                            initial_pose_imu_frame.c_str());
+                        return;  // Block: do not process this scan
+                    }
+                }
+
+                if (initial_pose_received) {
+                    state_ikfom cur_state = kf.get_x();
+                    cur_state.pos = initial_pos;
+                    cur_state.rot = initial_rot;
+                    kf.change_x(cur_state);
+                    state_point = kf.get_x();
+                    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                    RCLCPP_INFO(this->get_logger(),
+                        "Applied initial pose: pos=(%.2f, %.2f, %.2f)",
+                        state_point.pos(0), state_point.pos(1), state_point.pos(2));
+                }
+                initial_pose_applied = true;
+            }
+
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
 
@@ -1149,8 +1284,12 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_initial_pose_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_local_frame_reset_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
