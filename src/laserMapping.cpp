@@ -112,6 +112,8 @@ bool initial_pose_applied = false;
 V3D initial_pos = V3D::Zero();
 Eigen::Quaterniond initial_rot = Eigen::Quaterniond::Identity();
 bool reset_requested = false;                 // Flag for local frame reset
+double min_pose_cov = 0.0;                    // Floor for pose covariance diagonal
+double min_twist_cov = 0.0;                   // Floor for twist covariance diagonal
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -692,6 +694,15 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         for (int j = 0; j < 3; j++)
             odomAftMapped.twist.covariance[(i + 3) * 6 + (j + 3)] = P(15 + i, 15 + j);
 
+    // Floor covariance diagonals to prevent EKF from over-trusting LIO.
+    // IEKF covariance reflects optimization convergence, not real accuracy.
+    for (int i = 0; i < 6; i++) {
+        odomAftMapped.pose.covariance[i * 6 + i] =
+            std::max(odomAftMapped.pose.covariance[i * 6 + i], min_pose_cov);
+        odomAftMapped.twist.covariance[i * 6 + i] =
+            std::max(odomAftMapped.twist.covariance[i * 6 + i], min_twist_cov);
+    }
+
     pubOdomAftMapped->publish(odomAftMapped);
 
     // Publish camera_init -> lio_imu TF for visualization (e.g. Foxglove).
@@ -933,6 +944,13 @@ public:
         this->get_parameter_or<string>("initial_pose.odom_frame", initial_pose_odom_frame, "ascento/odom");
         this->get_parameter_or<string>("initial_pose.imu_frame", initial_pose_imu_frame, "vectornav_vn100_link");
 
+        // Covariance floor: IEKF covariance is unrealistically low (1e-6).
+        // Floor to realistic values so robot_localization doesn't over-trust LIO.
+        this->declare_parameter<double>("covariance.min_pose", 0.01);
+        this->declare_parameter<double>("covariance.min_twist", 0.001);
+        this->get_parameter_or<double>("covariance.min_pose", min_pose_cov, 0.01);
+        this->get_parameter_or<double>("covariance.min_twist", min_twist_cov, 0.001);
+
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
         if (require_initial_pose) {
             RCLCPP_INFO(this->get_logger(),
@@ -1044,6 +1062,7 @@ private:
             ikdtree.set_downsample_param(filter_size_map_min);
             kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
             p_imu->Reset();
+            path.poses.clear();
             RCLCPP_INFO(this->get_logger(), "Fast-LIO reset complete, waiting for initial pose");
         }
 
