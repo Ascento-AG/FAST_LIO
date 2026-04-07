@@ -374,31 +374,93 @@ void Preprocess::robosense_handler(
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZI> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  const uint32_t point_step = msg->point_step;
+  const int plsize =
+      static_cast<int>(msg->width) * static_cast<int>(msg->height);
   if (plsize == 0) return;
   pl_surf.reserve(plsize);
 
-  // Find timestamp field: "timestamp" (rslidar_sdk) or "time" (alt driver)
-  int ts_offset = -1;
-  uint8_t ts_datatype = 0;
-  std::string ts_field_name;
+  // Resolve field offsets and types from the message descriptor.
+  // This handles both rslidar_sdk layout (x,y,z,intensity,ring,timestamp)
+  // and the custom driver layout (x,y,z,time,intensity,ring) without
+  // hard-coding any offsets.
+  struct FieldInfo {
+    int offset = -1;
+    uint8_t datatype = 0;
+  };
+  FieldInfo f_x, f_y, f_z, f_intensity, f_ts;
   for (const auto& field : msg->fields) {
-    if (field.name == "timestamp" || field.name == "time") {
-      ts_offset = field.offset;
-      ts_datatype = field.datatype;
-      ts_field_name = field.name;
-      break;
-    }
+    auto set = [&](FieldInfo& fi,
+                   const sensor_msgs::msg::PointField& f) {
+      fi.offset = f.offset;
+      fi.datatype = f.datatype;
+    };
+    if (field.name == "x") set(f_x, field);
+    else if (field.name == "y") set(f_y, field);
+    else if (field.name == "z") set(f_z, field);
+    else if (field.name == "intensity") set(f_intensity, field);
+    else if (field.name == "timestamp" || field.name == "time")
+      set(f_ts, field);
   }
+
+  // Raw-byte readers that handle the type variants across drivers.
+  auto read_float = [](const uint8_t* base,
+                       const FieldInfo& fi) -> float {
+    const uint8_t* ptr = base + fi.offset;
+    if (fi.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      float v;
+      memcpy(&v, ptr, sizeof(float));
+      return v;
+    }
+    if (fi.datatype == sensor_msgs::msg::PointField::UINT16) {
+      uint16_t v;
+      memcpy(&v, ptr, sizeof(uint16_t));
+      return static_cast<float>(v);
+    }
+    if (fi.datatype == sensor_msgs::msg::PointField::FLOAT64) {
+      double v;
+      memcpy(&v, ptr, sizeof(double));
+      return static_cast<float>(v);
+    }
+    return 0.0f;
+  };
+  auto read_double = [](const uint8_t* base,
+                        const FieldInfo& fi) -> double {
+    if (fi.offset < 0) return 0.0;
+    const uint8_t* ptr = base + fi.offset;
+    if (fi.datatype == sensor_msgs::msg::PointField::FLOAT64) {
+      double v;
+      memcpy(&v, ptr, sizeof(double));
+      return v;
+    }
+    if (fi.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+      float v;
+      memcpy(&v, ptr, sizeof(float));
+      return static_cast<double>(v);
+    }
+    return 0.0;
+  };
+
+  // Convenience accessors for a given point index.
+  const uint8_t* data_ptr = msg->data.data();
+  auto pt = [&](int i) -> const uint8_t* {
+    return data_ptr + i * point_step;
+  };
+  auto pt_x = [&](int i) { return read_float(pt(i), f_x); };
+  auto pt_y = [&](int i) { return read_float(pt(i), f_y); };
+  auto pt_z = [&](int i) { return read_float(pt(i), f_z); };
+  auto pt_intensity = [&](int i) {
+    return (f_intensity.offset >= 0) ? read_float(pt(i), f_intensity)
+                                     : 0.0f;
+  };
+  auto pt_ts = [&](int i) { return read_double(pt(i), f_ts); };
 
   // --- First-scan logging: field layout ---
   static bool first_scan = true;
   if (first_scan) {
     first_scan = false;
     std::cerr << "[ROBOSENSE] First scan: " << plsize << " points"
-              << ", point_step=" << msg->point_step
+              << ", point_step=" << point_step
               << ", height=" << msg->height
               << ", width=" << msg->width << std::endl;
     std::cerr << "[ROBOSENSE] Fields:";
@@ -407,10 +469,10 @@ void Preprocess::robosense_handler(
                 << ",type=" << static_cast<int>(f.datatype) << ")";
     }
     std::cerr << std::endl;
-    if (ts_offset >= 0) {
-      std::cerr << "[ROBOSENSE] Using timestamp field: '" << ts_field_name
-                << "' at offset " << ts_offset
-                << " (datatype=" << static_cast<int>(ts_datatype) << ")"
+    if (f_ts.offset >= 0) {
+      std::cerr << "[ROBOSENSE] Using timestamp field at offset "
+                << f_ts.offset
+                << " (datatype=" << static_cast<int>(f_ts.datatype) << ")"
                 << std::endl;
     } else {
       std::cerr << "[ROBOSENSE] WARNING: No timestamp field found! "
@@ -419,44 +481,27 @@ void Preprocess::robosense_handler(
     }
   }
 
-  // Helper: read timestamp from raw PointCloud2 bytes
-  auto read_timestamp = [&](uint idx) -> double {
-    if (ts_offset < 0) return 0.0;
-    const uint8_t* ptr = &msg->data[idx * msg->point_step + ts_offset];
-    if (ts_datatype == sensor_msgs::msg::PointField::FLOAT64) {
-      double val;
-      memcpy(&val, ptr, sizeof(double));
-      return val;
-    } else if (ts_datatype == sensor_msgs::msg::PointField::FLOAT32) {
-      float val;
-      memcpy(&val, ptr, sizeof(float));
-      return static_cast<double>(val);
-    }
-    return 0.0;
-  };
-
   // Find scan_start_time from first valid (non-NaN) point.
   // The E1R pads unused slots with NaN coordinates; their timestamps
   // may still be valid but we want the first real point for consistency.
   double scan_start_time = 0.0;
   int first_valid_idx = -1;
   for (int i = 0; i < plsize; ++i) {
-    if (std::isfinite(pl_orig.points[i].x)) {
-      scan_start_time = read_timestamp(i);
+    if (std::isfinite(pt_x(i))) {
+      scan_start_time = pt_ts(i);
       first_valid_idx = i;
       break;
     }
   }
-  // If no valid point found, use pt[0] timestamp (still valid even on NaN pts)
   if (first_valid_idx < 0) {
-    scan_start_time = read_timestamp(0);
+    scan_start_time = pt_ts(0);
   }
 
   // Find scan_end_time from last valid point
   double scan_end_time = scan_start_time;
   for (int i = plsize - 1; i >= 0; --i) {
-    if (std::isfinite(pl_orig.points[i].x)) {
-      scan_end_time = read_timestamp(i);
+    if (std::isfinite(pt_x(i))) {
+      scan_end_time = pt_ts(i);
       break;
     }
   }
@@ -468,15 +513,14 @@ void Preprocess::robosense_handler(
     first_samples = false;
     std::cerr << "[ROBOSENSE]   first_valid_idx=" << first_valid_idx
               << std::endl;
-    // Log a few points around the first valid index
     int sample_start = std::max(0, first_valid_idx);
     int sample_end = std::min(plsize, sample_start + 3);
     for (int i = sample_start; i < sample_end; ++i) {
-      std::cerr << "[ROBOSENSE]   pt[" << i << "] xyz=("
-                << pl_orig.points[i].x << "," << pl_orig.points[i].y
-                << "," << pl_orig.points[i].z << ") intensity="
-                << pl_orig.points[i].intensity << " ts=" << std::fixed
-                << std::setprecision(9) << read_timestamp(i) << std::endl;
+      std::cerr << "[ROBOSENSE]   pt[" << i << "] xyz=(" << pt_x(i)
+                << "," << pt_y(i) << "," << pt_z(i)
+                << ") intensity=" << pt_intensity(i) << " ts="
+                << std::fixed << std::setprecision(9) << pt_ts(i)
+                << std::endl;
     }
     std::cerr << "[ROBOSENSE]   last valid ts=" << std::fixed
               << std::setprecision(9) << scan_end_time << std::endl;
@@ -495,7 +539,8 @@ void Preprocess::robosense_handler(
   }
 
   // --- Sanity warnings ---
-  if (ts_offset >= 0 && (scan_duration_ms < 0.0 || scan_duration_ms > 200.0)) {
+  if (f_ts.offset >= 0 &&
+      (scan_duration_ms < 0.0 || scan_duration_ms > 200.0)) {
     std::cerr << "[ROBOSENSE] WARNING: abnormal scan duration: "
               << scan_duration_ms << " ms (expected ~100ms for 10Hz)"
               << std::endl;
@@ -507,31 +552,28 @@ void Preprocess::robosense_handler(
   // through. We must reject them explicitly with std::isfinite.
   int kept = 0;
   int nan_count = 0;
-  for (uint i = 0; i < plsize; ++i) {
+  for (int i = 0; i < plsize; ++i) {
     if (i % point_filter_num != 0) continue;
 
-    if (!std::isfinite(pl_orig.points[i].x) ||
-        !std::isfinite(pl_orig.points[i].y) ||
-        !std::isfinite(pl_orig.points[i].z)) {
+    float x = pt_x(i), y = pt_y(i), z = pt_z(i);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
       ++nan_count;
       continue;
     }
 
-    double range_sq = pl_orig.points[i].x * pl_orig.points[i].x +
-                      pl_orig.points[i].y * pl_orig.points[i].y +
-                      pl_orig.points[i].z * pl_orig.points[i].z;
+    double range_sq = x * x + y * y + z * z;
     if (range_sq < (blind * blind)) continue;
 
     PointType added_pt;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
+    added_pt.x = x;
+    added_pt.y = y;
+    added_pt.z = z;
+    added_pt.intensity = pt_intensity(i);
     added_pt.curvature =
-        (read_timestamp(i) - scan_start_time) * 1000.0;  // relative ms
+        (pt_ts(i) - scan_start_time) * 1000.0;  // relative ms
 
     pl_surf.push_back(std::move(added_pt));
     ++kept;
