@@ -1924,10 +1924,15 @@ public:
 					P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
 				//}
 				solve_time += omp_get_wtime() - solve_start;
+				last_iter_count = i + 2;  // i starts at -1, so +2 gives 1-based count
+				last_converged = (t > 1);
 				return;
 			}
 			solve_time += omp_get_wtime() - solve_start;
 		}
+		// Loop ended without early return (should not normally happen)
+		last_iter_count = maximum_iter;
+		last_converged = false;
 	}
 
 	void change_x(state &input_state)
@@ -1952,6 +1957,11 @@ public:
 	const cov& get_P() const {
 		return P_;
 	}
+
+	// IEKF convergence diagnostics (set by update_iterated_dyn_share_modified)
+	int last_iter_count = 0;
+	bool last_converged = false;
+
 private:
 	state x_;
 	measurement m_;

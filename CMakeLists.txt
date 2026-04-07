@@ -83,6 +83,7 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
   "msg/Pose6D.msg"
+  "msg/Diagnostics.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

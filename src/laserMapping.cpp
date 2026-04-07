@@ -63,6 +63,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <fast_lio/msg/diagnostics.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -1005,7 +1006,7 @@ public:
 
         /*** ROS subscribe initialization ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(rclcpp::KeepLast(50)).best_effort(), imu_cbk);
         sub_initial_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/fast_lio/set_initial_pose", rclcpp::QoS(rclcpp::KeepLast(1)).reliable(), initial_pose_cbk);
 
@@ -1023,6 +1024,8 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("path", 20);
+        pubDiagnostics_ = this->create_publisher<fast_lio::msg::Diagnostics>(
+            "diagnostics", rclcpp::QoS(20).reliable());
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -1086,6 +1089,7 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+            double t_imu_done = omp_get_wtime();
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1234,6 +1238,35 @@ private:
             map_incremental();
             t5 = omp_get_wtime();
             
+            /******* Publish diagnostics *******/
+            {
+                auto diag = fast_lio::msg::Diagnostics();
+                diag.header.stamp = this->now();
+                diag.raw_points = feats_undistort->points.size();
+                diag.downsampled_points = feats_down_size;
+                diag.effective_points = effct_feat_num;
+                diag.mean_residual = res_mean_last;
+                diag.iekf_iterations = kf.last_iter_count;
+                diag.iekf_converged = kf.last_converged;
+                diag.time_imu_prop = t_imu_done - t0;
+                diag.time_downsample = t1 - t_imu_done;
+                diag.time_match = match_time;
+                diag.time_solve = solve_time + solve_H_time;
+                diag.time_map_update = t5 - t3;
+                diag.time_total = t5 - t0;
+                diag.imu_msgs_used = Measures.imu.size();
+                double imu_dt_max = 0;
+                for (size_t k = 1; k < Measures.imu.size(); k++) {
+                    double dt = get_time_sec(Measures.imu[k]->header.stamp)
+                              - get_time_sec(Measures.imu[k-1]->header.stamp);
+                    if (dt > imu_dt_max) imu_dt_max = dt;
+                }
+                diag.imu_dt_max = imu_dt_max;
+                diag.kdtree_size = ikdtree.size();
+                diag.map_points_added = add_point_size;
+                pubDiagnostics_->publish(diag);
+            }
+
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
@@ -1301,6 +1334,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<fast_lio::msg::Diagnostics>::SharedPtr pubDiagnostics_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_initial_pose_;
