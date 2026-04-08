@@ -68,12 +68,15 @@
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
-#define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
 
 // Non-holonomic constraint (defined in use-ikfom.hpp as extern)
 double nh_vy_damping = 0.0;
+
+// Measurement noise variance per point-to-plane residual (m^2).
+// Configurable via mapping.laser_point_cov. Default 0.001.
+double laser_point_cov = 0.001;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -955,6 +958,13 @@ public:
         this->get_parameter_or<double>("covariance.min_pose", min_pose_cov, 0.01);
         this->get_parameter_or<double>("covariance.min_twist", min_twist_cov, 0.001);
 
+        // Measurement noise: per-point variance for point-to-plane residuals (m^2).
+        // Higher = less trust in scan matching, more in IMU propagation.
+        // 0.001 = upstream default (3cm 1-sigma). 0.01 = more realistic with
+        // correlated points on flat surfaces (1cm aggregate at 430 pts).
+        this->declare_parameter<double>("mapping.laser_point_cov", 0.001);
+        this->get_parameter_or<double>("mapping.laser_point_cov", laser_point_cov, 0.001);
+
         // Non-holonomic constraint: damp body-frame lateral velocity (vy).
         // For differential-drive / non-holonomic robots where vy should be ~0.
         // Value is the damping rate in 1/s (0=disabled, 10=100ms time constant).
@@ -1233,7 +1243,7 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            kf.update_iterated_dyn_share_modified(laser_point_cov, solve_H_time);
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
