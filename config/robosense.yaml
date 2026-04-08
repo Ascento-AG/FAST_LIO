@@ -35,6 +35,9 @@
             extrinsic_R: [1., 0., 0.,
                           0., 1., 0.,
                           0., 0., 1.]
+            nh_vy_damping: 10.0  # Non-holonomic: lateral velocity damping rate (1/s).
+                                 # 0 = disabled. 10 = vy_body decays with ~100ms time constant.
+                                 # For differential-drive robots where vy should be ~0.
 
         publish:
             path_en: true                # true: publish Path

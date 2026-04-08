@@ -72,6 +72,9 @@
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
 
+// Non-holonomic constraint (defined in use-ikfom.hpp as extern)
+double nh_vy_damping = 0.0;
+
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
@@ -952,7 +955,18 @@ public:
         this->get_parameter_or<double>("covariance.min_pose", min_pose_cov, 0.01);
         this->get_parameter_or<double>("covariance.min_twist", min_twist_cov, 0.001);
 
+        // Non-holonomic constraint: damp body-frame lateral velocity (vy).
+        // For differential-drive / non-holonomic robots where vy should be ~0.
+        // Value is the damping rate in 1/s (0=disabled, 10=100ms time constant).
+        this->declare_parameter<double>("mapping.nh_vy_damping", 0.0);
+        this->get_parameter_or<double>("mapping.nh_vy_damping", nh_vy_damping, 0.0);
+
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        if (nh_vy_damping > 0.0) {
+            RCLCPP_INFO(this->get_logger(),
+                "Non-holonomic vy damping enabled: lambda=%.1f (tau=%.0f ms)",
+                nh_vy_damping, 1000.0 / nh_vy_damping);
+        }
         if (require_initial_pose) {
             RCLCPP_INFO(this->get_logger(),
                 "Requiring initial pose: will look up TF %s -> %s before processing",

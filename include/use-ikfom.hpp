@@ -42,18 +42,32 @@ MTK::get_cov<process_noise_ikfom>::type process_noise_cov()
 	return cov;
 }
 
-//double L_offset_to_I[3] = {0.04165, 0.02326, -0.0284}; // Avia 
+// Non-holonomic damping: rate at which body-frame vy decays (1/s).
+// 0 = disabled, 10 = vy decays to ~37% in 100ms.
+// Set from config in laserMapping.cpp.
+extern double nh_vy_damping;
+
+//double L_offset_to_I[3] = {0.04165, 0.02326, -0.0284}; // Avia
 //vect3 Lidar_offset_to_IMU(L_offset_to_I, 3);
 Eigen::Matrix<double, 24, 1> get_f(state_ikfom &s, const input_ikfom &in)
 {
 	Eigen::Matrix<double, 24, 1> res = Eigen::Matrix<double, 24, 1>::Zero();
 	vect3 omega;
 	in.gyro.boxminus(omega, s.bg);
-	vect3 a_inertial = s.rot * (in.acc-s.ba); 
+	vect3 a_inertial = s.rot * (in.acc-s.ba);
 	for(int i = 0; i < 3; i++ ){
 		res(i) = s.vel[i];
-		res(i + 3) =  omega[i]; 
-		res(i + 12) = a_inertial[i] + s.grav[i]; 
+		res(i + 3) =  omega[i];
+		res(i + 12) = a_inertial[i] + s.grav[i];
+	}
+	// Non-holonomic: damp body-frame lateral velocity.
+	// Adds virtual force F = -lambda * R * [0, vy_body, 0]^T
+	if (nh_vy_damping > 0.0) {
+		Eigen::Matrix3d R = s.rot.toRotationMatrix();
+		double vy_body = R.col(1).dot(s.vel);
+		for (int i = 0; i < 3; i++) {
+			res(i + 12) -= nh_vy_damping * R(i, 1) * vy_body;
+		}
 	}
 	return res;
 }
@@ -68,6 +82,13 @@ Eigen::Matrix<double, 24, 23> df_dx(state_ikfom &s, const input_ikfom &in)
 	in.gyro.boxminus(omega, s.bg);
 	cov.template block<3, 3>(12, 3) = -s.rot.toRotationMatrix()*MTK::hat(acc_);
 	cov.template block<3, 3>(12, 18) = -s.rot.toRotationMatrix();
+	// Non-holonomic: Jacobian of damping term w.r.t. velocity.
+	// d/dv [-lambda * R * P_vy * R^T * v] = -lambda * R_col1 * R_col1^T
+	if (nh_vy_damping > 0.0) {
+		Eigen::Matrix3d R = s.rot.toRotationMatrix();
+		Eigen::Vector3d r1 = R.col(1);
+		cov.template block<3, 3>(12, 12) -= nh_vy_damping * r1 * r1.transpose();
+	}
 	Eigen::Matrix<state_ikfom::scalar, 2, 1> vec = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
 	Eigen::Matrix<state_ikfom::scalar, 3, 2> grav_matrix;
 	s.S2_Mx(grav_matrix, vec, 21);
